@@ -1,0 +1,7 @@
+git+https://github.com/Project-MONAI/MONAI.git@07de215caf79dabec20ac53fb38d9f2df36f182a
+nibabel==3.1.1
+tqdm==4.59.0
+einops==0.4.1
+tensorboardX==2.1
+scipy==1.2.1
+protobuf~=3.20
