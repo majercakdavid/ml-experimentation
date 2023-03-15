@@ -27,6 +27,7 @@ from optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 from trainer import run_training
 from utils.data_utils import get_loader
 
+# from modified_utils import sliding_window_inference
 from monai.inferers import sliding_window_inference
 from monai.losses import DiceCELoss
 from monai.metrics import DiceMetric
@@ -204,6 +205,67 @@ parser.add_argument(
 )
 parser.add_argument("--squared_dice", action="store_true", help="use squared Dice")
 
+def deepspeed_model_update(model):
+    """Update the model with ops that do not modify tensor views."""
+    import types
+    from torch import nn
+
+    model.encoder1.layer.lrelu = nn.LeakyReLU(0.1)
+    model.encoder2.layer.lrelu = nn.LeakyReLU(0.1)
+    model.encoder3.layer.lrelu = nn.LeakyReLU(0.1)
+    model.encoder4.layer.lrelu = nn.LeakyReLU(0.1)
+    model.encoder10.layer.lrelu = nn.LeakyReLU(0.1)
+    model.decoder1.conv_block.lrelu = nn.LeakyReLU(0.1)
+    model.decoder2.conv_block.lrelu = nn.LeakyReLU(0.1)
+    model.decoder3.conv_block.lrelu = nn.LeakyReLU(0.1)
+    model.decoder4.conv_block.lrelu = nn.LeakyReLU(0.1)
+    model.decoder5.conv_block.lrelu = nn.LeakyReLU(0.1)
+
+    def custom_forward(self, inp):
+        residual = inp
+        out = self.conv1(inp)
+        out = self.norm1(out)
+        out = self.lrelu(out)
+        out = self.conv2(out)
+        out = self.norm2(out)
+        if hasattr(self, "conv3"):
+            residual = self.conv3(residual)
+        if hasattr(self, "norm3"):
+            residual = self.norm3(residual)
+        out = out + residual
+        out = self.lrelu(out)
+        return out
+
+    model.encoder1.layer.forward = types.MethodType(
+        custom_forward, model.encoder1.layer
+    )
+    model.encoder2.layer.forward = types.MethodType(
+        custom_forward, model.encoder2.layer
+    )
+    model.encoder3.layer.forward = types.MethodType(
+        custom_forward, model.encoder3.layer
+    )
+    model.encoder4.layer.forward = types.MethodType(
+        custom_forward, model.encoder4.layer
+    )
+    model.encoder10.layer.forward = types.MethodType(
+        custom_forward, model.encoder10.layer
+    )
+    model.decoder1.conv_block.forward = types.MethodType(
+        custom_forward, model.decoder1.conv_block
+    )
+    model.decoder2.conv_block.forward = types.MethodType(
+        custom_forward, model.decoder2.conv_block
+    )
+    model.decoder3.conv_block.forward = types.MethodType(
+        custom_forward, model.decoder3.conv_block
+    )
+    model.decoder4.conv_block.forward = types.MethodType(
+        custom_forward, model.decoder4.conv_block
+    )
+    model.decoder5.conv_block.forward = types.MethodType(
+        custom_forward, model.decoder5.conv_block
+    )
 
 def main():
     args = parser.parse_args()
@@ -217,21 +279,17 @@ def main():
         not args.distributed or not args.deepspeed
     ), "either distributed or deepspeed training can be selected but not both"
 
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256"
+    if args.deepspeed:
+        print("Using deepspeed")
+        import deepspeed
 
     main_worker(gpu=args.rank, args=args)
-    # if args.distributed:
-    #     args.ngpus_per_node = torch.cuda.device_count()
-    #     print("Found total gpus", args.ngpus_per_node)
-    #     args.world_size = args.ngpus_per_node * args.world_size
-    #     mp.spawn(main_worker, nprocs=args.ngpus_per_node, args=(args,))
-    # else:
-    #     main_worker(gpu=0, args=args)
 
 
 def main_worker(gpu, args):
-    # if args.distributed:
-    #     torch.multiprocessing.set_start_method("fork", force=True)
+    # Set memory partition size for PyTorch
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256"
+
     np.set_printoptions(formatter={"float": "{: 0.3f}".format}, suppress=True)
     args.gpu = gpu
     if args.distributed:
@@ -276,66 +334,8 @@ def main_worker(gpu, args):
         dropout_path_rate=args.dropout_path_rate,
         use_checkpoint=args.use_checkpoint,
     )
-    from torch import nn
-
-    model.encoder1.layer.lrelu = nn.LeakyReLU(0.1)
-    model.encoder2.layer.lrelu = nn.LeakyReLU(0.1)
-    model.encoder3.layer.lrelu = nn.LeakyReLU(0.1)
-    model.encoder4.layer.lrelu = nn.LeakyReLU(0.1)
-    model.encoder10.layer.lrelu = nn.LeakyReLU(0.1)
-    model.decoder1.conv_block.lrelu = nn.LeakyReLU(0.1)
-    model.decoder2.conv_block.lrelu = nn.LeakyReLU(0.1)
-    model.decoder3.conv_block.lrelu = nn.LeakyReLU(0.1)
-    model.decoder4.conv_block.lrelu = nn.LeakyReLU(0.1)
-    model.decoder5.conv_block.lrelu = nn.LeakyReLU(0.1)
-
-    def custom_forward(self, inp):
-        residual = inp
-        out = self.conv1(inp)
-        out = self.norm1(out)
-        out = self.lrelu(out)
-        out = self.conv2(out)
-        out = self.norm2(out)
-        if hasattr(self, "conv3"):
-            residual = self.conv3(residual)
-        if hasattr(self, "norm3"):
-            residual = self.norm3(residual)
-        out = out + residual
-        out = self.lrelu(out)
-        return out
-
-    import types
-
-    model.encoder1.layer.forward = types.MethodType(
-        custom_forward, model.encoder1.layer
-    )
-    model.encoder2.layer.forward = types.MethodType(
-        custom_forward, model.encoder2.layer
-    )
-    model.encoder3.layer.forward = types.MethodType(
-        custom_forward, model.encoder3.layer
-    )
-    model.encoder4.layer.forward = types.MethodType(
-        custom_forward, model.encoder4.layer
-    )
-    model.encoder10.layer.forward = types.MethodType(
-        custom_forward, model.encoder10.layer
-    )
-    model.decoder1.conv_block.forward = types.MethodType(
-        custom_forward, model.decoder1.conv_block
-    )
-    model.decoder2.conv_block.forward = types.MethodType(
-        custom_forward, model.decoder2.conv_block
-    )
-    model.decoder3.conv_block.forward = types.MethodType(
-        custom_forward, model.decoder3.conv_block
-    )
-    model.decoder4.conv_block.forward = types.MethodType(
-        custom_forward, model.decoder4.conv_block
-    )
-    model.decoder5.conv_block.forward = types.MethodType(
-        custom_forward, model.decoder5.conv_block
-    )
+    if args.deepspeed:
+        deepspeed_model_update(model)
 
     if args.resume_ckpt:
         model_dict = torch.load(
@@ -381,19 +381,16 @@ def main_worker(gpu, args):
         dice_loss = DiceCELoss(to_onehot_y=True, softmax=True)
     post_label = AsDiscrete(to_onehot=args.out_channels)
     post_pred = AsDiscrete(argmax=True, to_onehot=args.out_channels)
-    # post_label = AsDiscrete(to_onehot=True, n_classes=args.out_channels)
-    # post_pred = AsDiscrete(argmax=True, to_onehot=True, n_classes=args.out_channels)
     dice_acc = DiceMetric(
         include_background=True, reduction=MetricReduction.MEAN, get_not_nans=True
     )
-    # model_inferer = partial(
-    #     sliding_window_inference,
-    #     roi_size=inf_size,
-    #     sw_batch_size=args.sw_batch_size,
-    #     predictor=model,
-    #     overlap=args.infer_overlap,
-    # )
-    model_inferer = None
+    model_inferer = partial(
+        sliding_window_inference,
+        roi_size=inf_size,
+        sw_batch_size=args.sw_batch_size,
+        predictor=model,
+        overlap=args.infer_overlap,
+    )
 
     pytorch_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("Total parameters count", pytorch_total_params)
@@ -438,6 +435,9 @@ def main_worker(gpu, args):
             model=model,
             model_parameters=model.parameters(),
         )
+        print(f"fp16 enabled: {model_engine.fp16_enabled()}")
+        print(f"bf16 enabled: {model_engine.bfloat16_enabled()}")
+        print(f"communication_data_type: {model_engine.communication_data_type}")
     else:
         if args.optim_name == "adam":
             optimizer = torch.optim.Adam(

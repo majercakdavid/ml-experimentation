@@ -19,7 +19,7 @@ import torch
 import torch.nn.parallel
 import torch.utils.data.distributed
 from tensorboardX import SummaryWriter
-# from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler, autocast
 from utils.utils import AverageMeter, distributed_all_gather
 
 from monai.data import decollate_batch
@@ -42,13 +42,6 @@ def train_epoch(
     run_loss = AverageMeter()
     run_acc = AverageMeter()
     for idx, batch_data in enumerate(loader):
-        # print(f"len of batch_data: {len(batch_data)}")
-        # for i in range(len(batch_data)):
-        #     print(f"batch_data[{i}]: {list(batch_data[i].keys())}")
-
-        # if args.deepspeed:
-        #     batch_data = batch_data[args.rank]
-        
         if isinstance(batch_data, list):
             data, target = batch_data
         else:
@@ -57,8 +50,14 @@ def train_epoch(
         for param in model.parameters():
             param.grad = None
 
-        # with autocast(enabled=args.amp):
-        logits = model(data.to(torch.float16))
+        if args.deepspeed:
+            if model.fp16_enabled():
+                data = data.to(torch.float16)
+            elif model.bfloat16_enabled():
+                data = data.to(torch.bfloat16)
+
+        with autocast(enabled=args.amp):
+            logits = model(data)
         loss = loss_func(logits, target)
 
         if not logits.is_cuda:
@@ -72,7 +71,7 @@ def train_epoch(
             post_pred(val_pred_tensor) for val_pred_tensor in val_outputs_list
         ]
         acc_func.reset()
-        local_dice = acc_func(y_pred=val_output_convert, y=val_labels_convert)
+        acc_func(y_pred=val_output_convert, y=val_labels_convert)
 
         acc, not_nans = acc_func.aggregate()
         acc = acc.cuda(args.rank)
@@ -99,10 +98,10 @@ def train_epoch(
         if args.deepspeed:
             model.backward(loss)
             model.step()
-        # elif args.amp:
-        #     scaler.scale(loss).backward()
-        #     scaler.step(optimizer)
-        #     scaler.update()
+        elif args.amp:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
         else:
             loss.backward()
             optimizer.step()
@@ -150,22 +149,25 @@ def val_epoch(
     run_loss = AverageMeter()
     run_acc = AverageMeter()
     start_time = time.time()
-    print("Start validation")
     with torch.no_grad():
         for idx, batch_data in enumerate(loader):
-            print(f"len of batch_data: {len(batch_data)}")
             if isinstance(batch_data, list):
                 data, target = batch_data
             else:
                 data, target = batch_data["image"], batch_data["label"]
             data, target = data.cuda(args.rank), target.cuda(args.rank)
-            print("Calculating logits")
-            # with autocast(enabled=args.amp):
-            if model_inferer is not None:
-                logits = model_inferer(data.to(torch.float16))
-            else:
-                logits = model(data.to(torch.float16))
-            print(f"Logits shape: {logits.shape}")
+
+            if args.deepspeed:
+                if model.fp16_enabled():
+                    data = data.to(torch.float16)
+                elif model.bfloat16_enabled():
+                    data = data.to(torch.bfloat16)
+
+            with autocast(enabled=args.amp):
+                if model_inferer is not None:
+                    logits = model_inferer(data)
+                else:
+                    logits = model(data)
             if not logits.is_cuda:
                 target = target.cpu()
             val_labels_list = decollate_batch(target)
@@ -179,11 +181,9 @@ def val_epoch(
             acc_func.reset()
 
             local_dice = acc_func(y_pred=val_output_convert, y=val_labels_convert)
-            print(f"local_dice: {local_dice}")
             acc_func(y_pred=val_output_convert, y=val_labels_convert)
             acc, not_nans = acc_func.aggregate()
             acc = acc.cuda(args.rank)
-            print(f"acc: {acc}")
 
             loss = loss_func(logits, target)
             if args.distributed or args.deepspeed:
@@ -269,8 +269,8 @@ def run_training(
         if args.rank == 0:
             print("Writing Tensorboard logs to ", args.logdir)
     scaler = None
-    # if args.amp:
-    #     scaler = GradScaler()
+    if args.amp:
+        scaler = GradScaler()
     val_acc_max = 0.0
     for epoch in range(start_epoch, args.max_epochs):
         if args.distributed:
@@ -316,9 +316,6 @@ def run_training(
                 post_label=post_label,
                 post_pred=post_pred,
             )
-
-            print("val_avg_acc", val_avg_acc)
-            print("val_avg_loss", val_avg_loss)
 
             val_avg_acc = np.mean(val_avg_acc)
             val_avg_loss = np.mean(val_avg_loss)
